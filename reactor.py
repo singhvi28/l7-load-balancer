@@ -14,9 +14,11 @@ The reactor's job:
 
 from __future__ import annotations
 
+import heapq
 import selectors
 import socket
-from typing import TYPE_CHECKING
+import time
+from typing import List, Tuple, TYPE_CHECKING
 
 import config
 from connection import ProxyConnection, State
@@ -47,6 +49,9 @@ class Reactor:
         self._server_sock: socket.socket | None = None
         self._connections: dict[int, ProxyConnection] = {}  # fd → conn
         self._running = False
+        # Lazy-deletion deadline heap: (deadline, gen, conn_id)
+        self._deadlines: List[Tuple[float, int, int]] = []
+        self._conn_by_id: dict[int, ProxyConnection] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -89,23 +94,71 @@ class Reactor:
     def stop(self) -> None:
         self._running = False
 
+    # ── Deadline scheduling ───────────────────────────────────────────────
+
+    def _schedule_deadline(self, conn: ProxyConnection) -> None:
+        if conn.state == State.DONE:
+            return
+        cid = id(conn)
+        self._conn_by_id[cid] = conn
+        heapq.heappush(
+            self._deadlines, (conn.deadline, conn.deadline_gen, cid)
+        )
+
+    def _select_timeout(self) -> float:
+        """Seconds until next deadline, capped at 1.0 for signal responsiveness."""
+        now = time.monotonic()
+        while self._deadlines:
+            deadline, gen, cid = self._deadlines[0]
+            conn = self._conn_by_id.get(cid)
+            if (
+                conn is None
+                or conn.state == State.DONE
+                or gen != conn.deadline_gen
+            ):
+                heapq.heappop(self._deadlines)
+                continue
+            return min(1.0, max(0.0, deadline - now))
+        return 1.0
+
+    def _expire_timeouts(self) -> None:
+        now = time.monotonic()
+        while self._deadlines:
+            deadline, gen, cid = self._deadlines[0]
+            if deadline > now:
+                break
+            heapq.heappop(self._deadlines)
+            conn = self._conn_by_id.get(cid)
+            if conn is None or conn.state == State.DONE:
+                continue
+            if gen != conn.deadline_gen:
+                continue
+            try:
+                conn.handle_timeout()
+            except Exception:
+                log.exception("Error timing out connection %s", conn.client_addr)
+                conn.state = State.DONE
+
     # ── Main loop ─────────────────────────────────────────────────────────
 
     def _loop(self) -> None:
         while self._running:
-            events = self._sel.select(timeout=1.0)
+            timeout = self._select_timeout()
+            events = self._sel.select(timeout=timeout)
             for key, mask in events:
                 if key.data == "accept":
                     self._accept()
                 else:
                     conn: ProxyConnection = key.data
-                    fd = key.fileobj.fileno() if hasattr(key.fileobj, 'fileno') else -1
                     try:
                         self._dispatch(conn, key.fileobj, mask)
                     except Exception:
-                        log.exception("Unhandled error in connection %s", conn.client_addr)
+                        log.exception(
+                            "Unhandled error in connection %s", conn.client_addr
+                        )
                         conn.state = State.DONE
 
+            self._expire_timeouts()
             # Reap finished connections
             self._reap()
 
@@ -129,6 +182,7 @@ class Reactor:
                 client_sock, selectors.EVENT_READ, data=conn
             )
             self._connections[client_sock.fileno()] = conn
+            self._schedule_deadline(conn)
 
     # ── Dispatch ──────────────────────────────────────────────────────────
 
@@ -165,6 +219,7 @@ class Reactor:
         # Retry path: unregister the failed backend FD even if state
         # stayed CONNECTING_TO_BACKEND (same-state transition skip).
         self._flush_pending_unregister(conn)
+        self._schedule_deadline(conn)
 
     def _flush_pending_unregister(self, conn: ProxyConnection) -> None:
         """Unregister a closed backend socket left behind by a retry."""
@@ -279,6 +334,7 @@ class Reactor:
         ]
         for fd in dead_fds:
             conn = self._connections.pop(fd)
+            self._conn_by_id.pop(id(conn), None)
             # Unregister from selector
             for sock in (conn.client_sock, conn.backend_sock):
                 if sock is not None:
@@ -294,6 +350,8 @@ class Reactor:
         for conn in self._connections.values():
             conn.cleanup()
         self._connections.clear()
+        self._conn_by_id.clear()
+        self._deadlines.clear()
         if self._server_sock:
             try:
                 self._sel.unregister(self._server_sock)

@@ -32,6 +32,9 @@ CLIENT_RECV_SIZE = 65536       # bytes per recv() call
 BACKEND_RECV_SIZE = 65536
 CONNECT_TIMEOUT = 5            # seconds to wait for backend connect
 MAX_REQUEST_SIZE = 10 * 1024 * 1024   # 10 MiB safety cap
+CLIENT_IDLE_TIMEOUT = 30       # READING_REQUEST (Slowloris guard)
+BACKEND_TIMEOUT = 30           # FORWARDING_REQUEST + READING_RESPONSE
+CLIENT_SEND_TIMEOUT = 30       # FORWARDING_RESPONSE
 
 # ─── Backend Retries ─────────────────────────────────────────────────────────
 # MAX_BACKEND_RETRIES is additional attempts after the first (total = 1 + retries)

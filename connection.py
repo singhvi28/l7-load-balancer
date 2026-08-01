@@ -74,6 +74,8 @@ class ProxyConnection:
         "_client_bytes_sent",
         "_disconnect_notified",
         "pending_backend_unregister",
+        "deadline",
+        "deadline_gen",
     )
 
     def __init__(
@@ -112,7 +114,53 @@ class ProxyConnection:
         # Socket the reactor must unregister before we open a retry connect
         self.pending_backend_unregister: Optional[socket.socket] = None
 
-    # ── State handlers ────────────────────────────────────────────────────
+        self.deadline = 0.0
+        self.deadline_gen = 0
+        self.refresh_deadline()
+
+    # ── Deadlines ─────────────────────────────────────────────────────────
+
+    def _timeout_for_state(self) -> Optional[float]:
+        if self.state == State.READING_REQUEST:
+            return config.CLIENT_IDLE_TIMEOUT
+        if self.state == State.CONNECTING_TO_BACKEND:
+            return config.CONNECT_TIMEOUT
+        if self.state in (State.FORWARDING_REQUEST, State.READING_RESPONSE):
+            return config.BACKEND_TIMEOUT
+        if self.state == State.FORWARDING_RESPONSE:
+            return config.CLIENT_SEND_TIMEOUT
+        return None
+
+    def refresh_deadline(self) -> None:
+        """Bump generation and set a new absolute deadline for the current state."""
+        timeout = self._timeout_for_state()
+        if timeout is None:
+            return
+        self.deadline_gen += 1
+        self.deadline = time.monotonic() + timeout
+
+    def timed_out(self) -> bool:
+        return self.state != State.DONE and time.monotonic() >= self.deadline
+
+    def handle_timeout(self) -> None:
+        """Expire this connection — 408 / 504, or silent close if mid-relay."""
+        if self.state == State.DONE:
+            return
+        log.warning(
+            "Connection timeout in %s for %s",
+            self.state.name, self.client_addr,
+        )
+        if self.state == State.READING_REQUEST:
+            self._send_error(408, "Request Timeout")
+            return
+        if self._client_bytes_sent:
+            # Already writing to client — just tear down
+            if self.backend_addr and not self._disconnect_notified:
+                self._router.on_disconnect(self.backend_addr)
+                self._disconnect_notified = True
+            self.state = State.DONE
+            return
+        self._send_error(504, "Gateway Timeout")
 
     def handle_client_readable(self) -> None:
         """Called by the reactor when the client socket is readable."""
@@ -132,6 +180,7 @@ class ProxyConnection:
             return
 
         self.request_buf.extend(data)
+        self.refresh_deadline()
 
         if len(self.request_buf) > config.MAX_REQUEST_SIZE:
             self._send_error(413, "Request Entity Too Large")
@@ -161,6 +210,7 @@ class ProxyConnection:
     def _initiate_backend_connect(self, backend: Backend) -> None:
         """Start a non-blocking connect to the selected backend."""
         self.state = State.CONNECTING_TO_BACKEND
+        self.refresh_deadline()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
         self.backend_sock = sock
@@ -169,6 +219,7 @@ class ProxyConnection:
         if err == 0:
             # Immediate connect (unlikely but possible on localhost)
             self.state = State.FORWARDING_REQUEST
+            self.refresh_deadline()
         elif err in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN, 115):
             # Connection in progress — reactor will monitor for writability
             pass
@@ -191,6 +242,7 @@ class ProxyConnection:
                 self._fail_backend("connect failed")
                 return
             self.state = State.FORWARDING_REQUEST
+            self.refresh_deadline()
 
         if self.state != State.FORWARDING_REQUEST:
             return
@@ -206,10 +258,13 @@ class ProxyConnection:
             self._fail_backend("send failed")
             return
 
+        if sent:
+            self.refresh_deadline()
         self.forward_offset += sent
         if self.forward_offset >= len(self.forward_buf):
             # Entire request forwarded
             self.state = State.READING_RESPONSE
+            self.refresh_deadline()
 
     def handle_backend_readable(self) -> None:
         """Called when the backend socket has response data available."""
@@ -230,6 +285,7 @@ class ProxyConnection:
             return
 
         self.response_buf.extend(data)
+        self.refresh_deadline()
 
         # Parse status from first chunk if we haven't yet
         if self.response_status is None:
@@ -266,6 +322,7 @@ class ProxyConnection:
         self.relay_buf = bytes(self.response_buf)
         self.relay_offset = 0
         self.state = State.FORWARDING_RESPONSE
+        self.refresh_deadline()
 
     def handle_client_writable(self) -> None:
         """Called when the client socket is writable (relay phase)."""
@@ -282,6 +339,7 @@ class ProxyConnection:
 
         if sent:
             self._client_bytes_sent = True
+            self.refresh_deadline()
         self.relay_offset += sent
         if self.relay_offset >= len(self.relay_buf):
             self._finish()
