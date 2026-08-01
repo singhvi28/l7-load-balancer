@@ -10,6 +10,7 @@ from http_parser import (
     serialise_request,
     parse_response_status,
     get_content_length,
+    CONTENT_LENGTH_ABSENT,
     get_response_content_length,
 )
 
@@ -144,6 +145,14 @@ class TestGetResponseContentLength:
     def test_present(self):
         buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         assert get_response_content_length(buf) == 5
+
+    def test_zero_length(self):
+        buf = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+        assert get_response_content_length(buf) == 0
+
+    def test_absent(self):
+        buf = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello"
+        assert get_response_content_length(buf) == CONTENT_LENGTH_ABSENT
 
     def test_no_headers_complete(self):
         buf = b"HTTP/1.1 200 OK\r\nContent"

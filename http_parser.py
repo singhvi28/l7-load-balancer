@@ -20,6 +20,12 @@ from typing import Optional, Tuple, Dict
 HEADER_DELIM = b"\r\n\r\n"
 LINE_DELIM = b"\r\n"
 
+# get_response_content_length sentinels:
+#   -1  headers not yet complete
+#   -2  headers complete, Content-Length absent (close-delimited body)
+#  >=0  explicit Content-Length (including 0)
+CONTENT_LENGTH_ABSENT = -2
+
 
 # ─── Request Parsing ─────────────────────────────────────────────────────────
 
@@ -152,7 +158,12 @@ def parse_response_status(buf: bytes) -> Tuple[Optional[int], Optional[str]]:
 
 
 def get_response_content_length(buf: bytes) -> int:
-    """Peek at the Content-Length in a response buffer (best-effort)."""
+    """Peek at the Content-Length in a response buffer (best-effort).
+
+    Returns ``-1`` if headers are incomplete, ``CONTENT_LENGTH_ABSENT`` (-2)
+    if headers are complete but the header is missing, or ``>= 0`` for an
+    explicit length (including a genuine ``Content-Length: 0``).
+    """
     hdr_end = buf.find(HEADER_DELIM)
     if hdr_end == -1:
         return -1  # headers not complete
@@ -167,4 +178,4 @@ def get_response_content_length(buf: bytes) -> int:
                 return int(line[colon + 1:].strip())
             except ValueError:
                 return 0
-    return 0  # no Content-Length → assume 0 (simplification)
+    return CONTENT_LENGTH_ABSENT
