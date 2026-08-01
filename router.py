@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import heapq
 import threading
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 Backend = Tuple[str, int]  # (host, port)
 
@@ -31,13 +31,20 @@ class RoundRobinRouter:
 
     # ── Selection ─────────────────────────────────────────────────────────
 
-    def next_backend(self) -> Optional[Backend]:
+    def next_backend(
+        self, exclude: Optional[Set[Backend]] = None
+    ) -> Optional[Backend]:
         with self._lock:
             if not self._healthy:
                 return None
-            backend = self._healthy[self._index % len(self._healthy)]
-            self._index += 1
-            return backend
+            skip = exclude or set()
+            n = len(self._healthy)
+            for _ in range(n):
+                backend = self._healthy[self._index % n]
+                self._index += 1
+                if backend not in skip:
+                    return backend
+            return None
 
     # ── Health management ─────────────────────────────────────────────────
 
@@ -97,23 +104,33 @@ class LeastConnectionsRouter:
 
     # ── Selection ─────────────────────────────────────────────────────────
 
-    def next_backend(self) -> Optional[Backend]:
+    def next_backend(
+        self, exclude: Optional[Set[Backend]] = None
+    ) -> Optional[Backend]:
         with self._lock:
-            # Drain unhealthy and stale entries
+            skip = exclude or set()
+            deferred: List[Tuple[int, int, Backend]] = []
+            chosen: Optional[Tuple[int, int, Backend]] = None
+
             while self._heap:
-                count, tb, backend = self._heap[0]
+                count, tb, backend = heapq.heappop(self._heap)
                 if backend not in self._healthy_set:
-                    heapq.heappop(self._heap)
                     continue
                 if count != self._counts.get(backend, 0):
-                    heapq.heappop(self._heap)  # stale entry
+                    continue  # stale
+                if backend in skip:
+                    deferred.append((count, tb, backend))
                     continue
+                chosen = (count, tb, backend)
                 break
-            else:
+
+            for entry in deferred:
+                heapq.heappush(self._heap, entry)
+
+            if chosen is None:
                 return None
 
-            count, tb, backend = heapq.heappop(self._heap)
-            # Increment and push back with a new tiebreak
+            count, tb, backend = chosen
             new_count = count + 1
             self._counts[backend] = new_count
             self._tiebreak += 1
