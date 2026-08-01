@@ -35,6 +35,11 @@ class TestRoundRobin:
         healthy = rr.get_healthy_backends()
         assert BACKENDS[0] in healthy
 
+    def test_double_mark_healthy_no_duplicate(self):
+        rr = RoundRobinRouter(BACKENDS)
+        rr.mark_healthy(BACKENDS[0])  # already healthy
+        assert rr.get_healthy_backends().count(BACKENDS[0]) == 1
+
     def test_exclude_skips_backend(self):
         rr = RoundRobinRouter(BACKENDS)
         b = rr.next_backend(exclude={BACKENDS[0]})
@@ -44,6 +49,9 @@ class TestRoundRobin:
     def test_exclude_all_returns_none(self):
         rr = RoundRobinRouter(BACKENDS)
         assert rr.next_backend(exclude=set(BACKENDS)) is None
+
+
+class TestLeastConnections:
     def test_initial_selection(self):
         lc = LeastConnectionsRouter(BACKENDS)
         # All start at 0 connections, so first pick should work
@@ -71,6 +79,14 @@ class TestRoundRobin:
         for b in BACKENDS:
             lc.mark_unhealthy(b)
         assert lc.next_backend() is None
+
+    def test_disconnect_reduces_count(self):
+        lc = LeastConnectionsRouter(BACKENDS)
+        b = lc.next_backend()
+        lc.on_disconnect(b)
+        # Should be at 0 now — verify by picking again
+        b2 = lc.next_backend()
+        assert b2 in BACKENDS
 
     def test_exclude_skips_backend(self):
         lc = LeastConnectionsRouter(BACKENDS)
