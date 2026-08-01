@@ -36,10 +36,13 @@ class Reactor:
         router: RoundRobinRouter | LeastConnectionsRouter,
         host: str = config.LISTEN_HOST,
         port: int = config.LISTEN_PORT,
+        *,
+        require_reuseport: bool = False,
     ) -> None:
         self._router = router
         self._host = host
         self._port = port
+        self._require_reuseport = require_reuseport
         self._sel = selectors.DefaultSelector()
         self._server_sock: socket.socket | None = None
         self._connections: dict[int, ProxyConnection] = {}  # fd → conn
@@ -53,6 +56,15 @@ class Reactor:
         self._server_sock.setsockopt(
             socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
         )
+        if hasattr(socket, "SO_REUSEPORT"):
+            self._server_sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_REUSEPORT, 1
+            )
+        elif self._require_reuseport:
+            raise RuntimeError(
+                "SO_REUSEPORT is required for --workers > 1 but is not "
+                "available on this platform"
+            )
         self._server_sock.setblocking(False)
         self._server_sock.bind((self._host, self._port))
         self._server_sock.listen(config.LISTEN_BACKLOG)

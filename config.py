@@ -8,6 +8,7 @@ All tunables live here so the rest of the codebase stays clean.
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8080
 LISTEN_BACKLOG = 1024          # kernel accept-queue depth
+WORKERS = 1                    # processes sharing the listen port via SO_REUSEPORT
 
 # ─── Backend Pool ────────────────────────────────────────────────────────────
 # Each entry is (host, port).  The health-checker will promote / demote these.

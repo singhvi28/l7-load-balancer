@@ -24,7 +24,7 @@ def setup_logging() -> logging.Logger:
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)-5s | %(message)s",
+            "%(asctime)s | pid=%(process)d | %(levelname)-5s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
         handler.setFormatter(formatter)
