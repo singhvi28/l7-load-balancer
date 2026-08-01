@@ -12,6 +12,8 @@ from http_parser import (
     get_content_length,
     CONTENT_LENGTH_ABSENT,
     get_response_content_length,
+    is_chunked_response,
+    try_consume_chunked_body,
 )
 
 
@@ -157,3 +159,54 @@ class TestGetResponseContentLength:
     def test_no_headers_complete(self):
         buf = b"HTTP/1.1 200 OK\r\nContent"
         assert get_response_content_length(buf) == -1
+
+
+class TestChunkedResponse:
+    def test_is_chunked_true(self):
+        buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        assert is_chunked_response(buf) is True
+
+    def test_is_chunked_with_content_length_still_chunked(self):
+        buf = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Length: 999\r\n"
+            b"\r\n"
+        )
+        assert is_chunked_response(buf) is True
+
+    def test_is_chunked_false(self):
+        buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        assert is_chunked_response(buf) is False
+
+    def test_is_chunked_incomplete_headers(self):
+        assert is_chunked_response(b"HTTP/1.1 200 OK\r\nTransfer") is None
+
+    def test_single_chunk(self):
+        body = b"5\r\nhello\r\n0\r\n\r\n"
+        assert try_consume_chunked_body(body) == len(body)
+
+    def test_multiple_chunks(self):
+        body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+        assert try_consume_chunked_body(body) == len(body)
+
+    def test_incomplete_mid_size_line(self):
+        assert try_consume_chunked_body(b"5\r\nhello\r\n") is None
+        assert try_consume_chunked_body(b"5") is None
+
+    def test_incomplete_mid_data(self):
+        assert try_consume_chunked_body(b"5\r\nhel") is None
+
+    def test_with_trailers(self):
+        body = b"4\r\nWiki\r\n0\r\nExpires: Wed, 21 Oct 2015\r\n\r\n"
+        assert try_consume_chunked_body(body) == len(body)
+
+    def test_chunk_ext(self):
+        body = b"5;foo=bar\r\nhello\r\n0\r\n\r\n"
+        assert try_consume_chunked_body(body) == len(body)
+
+    def test_extra_bytes_after_complete(self):
+        complete = b"5\r\nhello\r\n0\r\n\r\n"
+        body = complete + b"GARBAGE"
+        assert try_consume_chunked_body(body) == len(complete)
+

@@ -6,7 +6,8 @@ Responsibilities
 • Locate the \\r\\n\\r\\n header/body boundary.
 • Parse the request line (method, path, version).
 • Extract headers into a dict (case-insensitive lookup).
-• Determine body length via Content-Length (chunked is out of scope).
+• Determine body length via Content-Length (request bodies: Content-Length only).
+• Detect chunked Transfer-Encoding on *responses* and know when framing ends.
 • Inject / append the ``X-Forwarded-For`` header with the client's IP.
 • Re-serialise a modified request back to bytes for forwarding.
 • Parse response status lines for access-log purposes.
@@ -179,3 +180,80 @@ def get_response_content_length(buf: bytes) -> int:
             except ValueError:
                 return 0
     return CONTENT_LENGTH_ABSENT
+
+
+# ─── Chunked Transfer-Encoding (responses) ───────────────────────────────────
+# Request bodies remain Content-Length-only; streaming would need a state machine.
+
+
+def is_chunked_response(buf: bytes) -> Optional[bool]:
+    """Return whether the response uses ``Transfer-Encoding: chunked``.
+
+    ``None`` if response headers are not yet complete.
+    """
+    hdr_end = buf.find(HEADER_DELIM)
+    if hdr_end == -1:
+        return None
+    header_section = buf[:hdr_end].decode("latin-1", errors="replace")
+    for line in header_section.split("\r\n")[1:]:
+        colon = line.find(":")
+        if colon == -1:
+            continue
+        name = line[:colon].strip().lower()
+        if name == "transfer-encoding":
+            value = line[colon + 1:].strip().lower()
+            # TE can be a list; "chunked" must be present (usually last)
+            return "chunked" in [p.strip() for p in value.split(",")]
+    return False
+
+
+def try_consume_chunked_body(body: bytes) -> Optional[int]:
+    """Scan a chunked body buffer; return total framed length when complete.
+
+    Pure function over the full body so far (fits the current full-buffer
+    model). Returns ``None`` if more bytes are needed. On success, the return
+    value is the number of body bytes that constitute a complete chunked
+    message (including size lines, data, trailers, and the final CRLF).
+    """
+    pos = 0
+    length = len(body)
+
+    while True:
+        # Need a complete size line
+        line_end = body.find(LINE_DELIM, pos)
+        if line_end == -1:
+            return None
+
+        size_line = body[pos:line_end].decode("latin-1", errors="replace")
+        # Strip chunk-ext (`;...`)
+        size_token = size_line.split(";", 1)[0].strip()
+        try:
+            chunk_size = int(size_token, 16)
+        except ValueError:
+            return None  # malformed — treat as incomplete / caller may 502
+
+        pos = line_end + len(LINE_DELIM)
+
+        if chunk_size == 0:
+            # Last-chunk: trailers then final CRLF
+            # Trailers are zero or more header lines ending with a blank line
+            trailer_end = body.find(HEADER_DELIM, pos)
+            if trailer_end == -1:
+                # Could be just a final CRLF with no trailer fields —
+                # HEADER_DELIM is \r\n\r\n; a bare final CRLF after last-chunk
+                # means body[pos:] should start with \r\n for empty trailers,
+                # i.e. we need LINE_DELIM at pos (empty trailer-part = CRLF)
+                if body[pos:pos + len(LINE_DELIM)] == LINE_DELIM:
+                    return pos + len(LINE_DELIM)
+                return None
+            return trailer_end + len(HEADER_DELIM)
+
+        # Need chunk-data (chunk_size bytes) + trailing CRLF
+        need = chunk_size + len(LINE_DELIM)
+        if pos + need > length:
+            return None
+        # Verify CRLF after data (best-effort; still advance)
+        pos += chunk_size
+        if body[pos:pos + len(LINE_DELIM)] != LINE_DELIM:
+            return None
+        pos += len(LINE_DELIM)

@@ -28,6 +28,8 @@ from http_parser import (
     serialise_request,
     try_parse_request,
     get_response_content_length,
+    is_chunked_response,
+    try_consume_chunked_body,
     HEADER_DELIM,
 )
 from logger import access_log, get_logger
@@ -69,6 +71,7 @@ class ProxyConnection:
         "_response_headers_done",
         "_response_content_length",
         "_response_body_received",
+        "_response_is_chunked",
         "_tried_backends",
         "_backend_attempts",
         "_client_bytes_sent",
@@ -106,6 +109,7 @@ class ProxyConnection:
         self._response_headers_done = False
         self._response_content_length = -1
         self._response_body_received = 0
+        self._response_is_chunked = False
 
         self._tried_backends: Set[Backend] = set()
         self._backend_attempts = 0
@@ -280,7 +284,17 @@ class ProxyConnection:
             return
 
         if not data:
-            # Backend closed — whatever we have is the full response
+            # Backend closed — close-delimited body, or truncated chunked
+            if self._response_is_chunked and self._response_headers_done:
+                hdr_end = self.response_buf.find(HEADER_DELIM)
+                body = (
+                    bytes(self.response_buf[hdr_end + len(HEADER_DELIM):])
+                    if hdr_end != -1
+                    else b""
+                )
+                if try_consume_chunked_body(body) is None:
+                    self._fail_backend("truncated chunked response")
+                    return
             self._prepare_relay()
             return
 
@@ -299,23 +313,37 @@ class ProxyConnection:
             if hdr_end != -1:
                 self._response_headers_done = True
                 header_len = hdr_end + len(HEADER_DELIM)
-                self._response_content_length = get_response_content_length(
-                    bytes(self.response_buf)
-                )
+                chunked = is_chunked_response(bytes(self.response_buf))
+                self._response_is_chunked = bool(chunked)
+                if self._response_is_chunked:
+                    # RFC 7230: ignore Content-Length when chunked
+                    self._response_content_length = -1
+                else:
+                    self._response_content_length = get_response_content_length(
+                        bytes(self.response_buf)
+                    )
                 self._response_body_received = len(self.response_buf) - header_len
 
-        if self._response_headers_done and self._response_content_length >= 0:
+        if not self._response_headers_done:
+            return
+
+        hdr_end = self.response_buf.find(HEADER_DELIM)
+        header_len = hdr_end + len(HEADER_DELIM)
+        body = bytes(self.response_buf[header_len:])
+
+        if self._response_is_chunked:
+            framed = try_consume_chunked_body(body)
+            if framed is not None:
+                # Truncate any bytes past the complete chunked message
+                del self.response_buf[header_len + framed:]
+                self._prepare_relay()
+            return
+
+        self._response_body_received = len(body)
+        if self._response_content_length >= 0:
             if self._response_body_received >= self._response_content_length:
                 self._prepare_relay()
                 return
-
-        # Track body bytes for subsequent chunks
-        if self._response_headers_done:
-            self._response_body_received = (
-                len(self.response_buf)
-                - self.response_buf.find(HEADER_DELIM)
-                - len(HEADER_DELIM)
-            )
 
     def _prepare_relay(self) -> None:
         """Transition to relaying the response back to the client."""
@@ -395,6 +423,7 @@ class ProxyConnection:
                 self._response_headers_done = False
                 self._response_content_length = -1
                 self._response_body_received = 0
+                self._response_is_chunked = False
                 self._initiate_backend_connect(backend)
                 return
 
