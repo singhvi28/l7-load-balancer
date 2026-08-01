@@ -150,10 +150,51 @@ class Reactor:
             conn.handle_backend_writable()
             self._transition(conn, prev_state)
 
+        # Retry path: unregister the failed backend FD even if state
+        # stayed CONNECTING_TO_BACKEND (same-state transition skip).
+        self._flush_pending_unregister(conn)
+
+    def _flush_pending_unregister(self, conn: ProxyConnection) -> None:
+        """Unregister a closed backend socket left behind by a retry."""
+        old = conn.pending_backend_unregister
+        if old is None:
+            return
+        try:
+            self._sel.unregister(old)
+        except (KeyError, ValueError):
+            pass
+        conn.pending_backend_unregister = None
+
+        # New backend may already be in CONNECTING/FORWARDING without a
+        # state change that would have registered it.
+        if conn.backend_sock is not None and conn.state in (
+            State.CONNECTING_TO_BACKEND,
+            State.FORWARDING_REQUEST,
+        ):
+            try:
+                self._sel.register(
+                    conn.backend_sock,
+                    selectors.EVENT_WRITE,
+                    data=conn,
+                )
+            except (KeyError, ValueError):
+                try:
+                    self._sel.modify(
+                        conn.backend_sock,
+                        selectors.EVENT_WRITE,
+                        data=conn,
+                    )
+                except (KeyError, ValueError):
+                    pass
+
     # ── State transition → selector updates ───────────────────────────────
 
     def _transition(self, conn: ProxyConnection, prev_state: State) -> None:
         """Update selector registrations when a connection changes state."""
+        # Always clear a pending unregister before re-registering
+        if conn.pending_backend_unregister is not None:
+            self._flush_pending_unregister(conn)
+
         if conn.state == prev_state:
             return
 
@@ -179,7 +220,14 @@ class Reactor:
                         data=conn,
                     )
                 except (KeyError, ValueError):
-                    pass
+                    try:
+                        self._sel.register(
+                            conn.backend_sock,
+                            selectors.EVENT_WRITE,
+                            data=conn,
+                        )
+                    except (KeyError, ValueError):
+                        pass
 
         elif conn.state == State.READING_RESPONSE:
             # Done writing to backend — switch to reading

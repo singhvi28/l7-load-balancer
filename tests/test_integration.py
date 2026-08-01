@@ -161,3 +161,72 @@ class TestXForwardedFor:
         # Here we just ensure the request completes successfully.
         resp = _send_http_get("127.0.0.1", port, "/check-xff")
         assert resp.get("path") == "/check-xff"
+
+
+class TestBackendRetries:
+    def test_get_retries_dead_backend(self, free_port, backend_ports):
+        """GET should fail over from a dead backend to a live one."""
+        dead = ("127.0.0.1", 19991)
+        live = ("127.0.0.1", backend_ports[0])
+        router = RoundRobinRouter([dead, live])
+        reactor = Reactor(router, host="127.0.0.1", port=free_port)
+        t = threading.Thread(target=reactor.start, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        try:
+            resp = _send_http_get("127.0.0.1", free_port)
+            assert "backend" in resp
+            assert int(resp["backend"].strip(":")) == backend_ports[0]
+        finally:
+            reactor.stop()
+            time.sleep(0.2)
+
+    def test_post_does_not_retry(self, free_port):
+        """POST to a dead-only pool should 502 without succeeding."""
+        dead = ("127.0.0.1", 19992)
+        router = RoundRobinRouter([dead])
+        reactor = Reactor(router, host="127.0.0.1", port=free_port)
+        t = threading.Thread(target=reactor.start, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        try:
+            with socket.create_connection(("127.0.0.1", free_port), timeout=5) as sock:
+                body = b'{"x":1}'
+                req = (
+                    f"POST /api HTTP/1.1\r\n"
+                    f"Host: localhost\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                ).encode() + body
+                sock.sendall(req)
+                data = sock.recv(4096)
+                assert b"502" in data
+        finally:
+            reactor.stop()
+            time.sleep(0.2)
+
+    def test_retry_cap_respected(self, free_port, monkeypatch):
+        """Exhausting retries against dead backends yields 502."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_BACKEND_RETRIES", 1)
+        dead1 = ("127.0.0.1", 19993)
+        dead2 = ("127.0.0.1", 19994)
+        router = RoundRobinRouter([dead1, dead2])
+        reactor = Reactor(router, host="127.0.0.1", port=free_port)
+        t = threading.Thread(target=reactor.start, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        try:
+            with socket.create_connection(("127.0.0.1", free_port), timeout=5) as sock:
+                sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                data = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                assert b"502" in data
+        finally:
+            reactor.stop()
+            time.sleep(0.2)

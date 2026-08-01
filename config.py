@@ -32,6 +32,11 @@ BACKEND_RECV_SIZE = 65536
 CONNECT_TIMEOUT = 5            # seconds to wait for backend connect
 MAX_REQUEST_SIZE = 10 * 1024 * 1024   # 10 MiB safety cap
 
+# ─── Backend Retries ─────────────────────────────────────────────────────────
+# MAX_BACKEND_RETRIES is additional attempts after the first (total = 1 + retries)
+MAX_BACKEND_RETRIES = 2
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
 ACCESS_LOG_FORMAT = (

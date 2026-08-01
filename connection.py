@@ -17,9 +17,8 @@ from __future__ import annotations
 import errno
 import socket
 import time
-from collections import deque
 from enum import Enum, auto
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Optional, Set, Tuple, TYPE_CHECKING
 
 import config
 from http_parser import (
@@ -57,12 +56,12 @@ class ProxyConnection:
         "client_sock", "client_addr",
         "backend_sock", "backend_addr",
         "state",
-        "request_buf",          # raw bytes accumulator for the client request
+        "request_buf",
         "parsed_request",
-        "forward_buf",          # bytes to send to backend
+        "forward_buf",
         "forward_offset",
-        "response_buf",         # raw bytes accumulator for the backend response
-        "relay_buf",            # bytes to send back to client
+        "response_buf",
+        "relay_buf",
         "relay_offset",
         "start_time",
         "response_status",
@@ -70,6 +69,11 @@ class ProxyConnection:
         "_response_headers_done",
         "_response_content_length",
         "_response_body_received",
+        "_tried_backends",
+        "_backend_attempts",
+        "_client_bytes_sent",
+        "_disconnect_notified",
+        "pending_backend_unregister",
     )
 
     def __init__(
@@ -100,6 +104,13 @@ class ProxyConnection:
         self._response_headers_done = False
         self._response_content_length = -1
         self._response_body_received = 0
+
+        self._tried_backends: Set[Backend] = set()
+        self._backend_attempts = 0
+        self._client_bytes_sent = False
+        self._disconnect_notified = False
+        # Socket the reactor must unregister before we open a retry connect
+        self.pending_backend_unregister: Optional[socket.socket] = None
 
     # ── State handlers ────────────────────────────────────────────────────
 
@@ -143,6 +154,8 @@ class ProxyConnection:
             return
 
         self.backend_addr = backend
+        self._backend_attempts = 1
+        self._disconnect_notified = False
         self._initiate_backend_connect(backend)
 
     def _initiate_backend_connect(self, backend: Backend) -> None:
@@ -161,7 +174,7 @@ class ProxyConnection:
             pass
         else:
             log.error("connect_ex to %s:%d failed: errno=%d", *backend, err)
-            self._send_error(502, "Bad Gateway")
+            self._fail_backend("connect_ex failed")
 
     def handle_backend_writable(self) -> None:
         """Called when the backend socket becomes writable."""
@@ -175,7 +188,7 @@ class ProxyConnection:
                     "Backend connect to %s:%d failed: errno=%d",
                     *self.backend_addr, err,
                 )
-                self._send_error(502, "Bad Gateway")
+                self._fail_backend("connect failed")
                 return
             self.state = State.FORWARDING_REQUEST
 
@@ -190,7 +203,7 @@ class ProxyConnection:
         except (BlockingIOError, InterruptedError):
             return
         except OSError:
-            self._send_error(502, "Bad Gateway")
+            self._fail_backend("send failed")
             return
 
         self.forward_offset += sent
@@ -208,7 +221,7 @@ class ProxyConnection:
         except (BlockingIOError, InterruptedError):
             return
         except OSError:
-            self._send_error(502, "Bad Gateway")
+            self._fail_backend("recv failed")
             return
 
         if not data:
@@ -267,9 +280,67 @@ class ProxyConnection:
             self.state = State.DONE
             return
 
+        if sent:
+            self._client_bytes_sent = True
         self.relay_offset += sent
         if self.relay_offset >= len(self.relay_buf):
             self._finish()
+
+    # ── Backend failure / retry ───────────────────────────────────────────
+
+    def _can_retry(self) -> bool:
+        if self._client_bytes_sent:
+            return False
+        req = self.parsed_request
+        if req is None:
+            return False
+        if req.method.upper() not in config.IDEMPOTENT_METHODS:
+            return False
+        # attempts so far; retries remaining = MAX - (attempts - 1)
+        return self._backend_attempts <= config.MAX_BACKEND_RETRIES
+
+    def _fail_backend(self, reason: str) -> None:
+        """Handle a backend I/O failure — retry if allowed, else 502."""
+        log.warning(
+            "Backend failure (%s) for %s — attempt %d",
+            reason,
+            self.backend_addr,
+            self._backend_attempts,
+        )
+
+        failed = self.backend_addr
+        if failed is not None and not self._disconnect_notified:
+            self._router.on_disconnect(failed)
+            self._disconnect_notified = True
+
+        old_sock = self.backend_sock
+        if old_sock is not None:
+            self.pending_backend_unregister = old_sock
+            try:
+                old_sock.close()
+            except OSError:
+                pass
+            self.backend_sock = None
+
+        if failed is not None:
+            self._tried_backends.add(failed)
+
+        if self._can_retry():
+            backend = self._router.next_backend(exclude=self._tried_backends)
+            if backend is not None:
+                self.backend_addr = backend
+                self._backend_attempts += 1
+                self._disconnect_notified = False
+                self.forward_offset = 0
+                self.response_buf = bytearray()
+                self.response_status = None
+                self._response_headers_done = False
+                self._response_content_length = -1
+                self._response_body_received = 0
+                self._initiate_backend_connect(backend)
+                return
+
+        self._send_error(502, "Bad Gateway")
 
     # ── Error responses ───────────────────────────────────────────────────
 
@@ -286,6 +357,7 @@ class ProxyConnection:
         )
         try:
             self.client_sock.sendall(response.encode("latin-1"))
+            self._client_bytes_sent = True
         except OSError:
             pass
         self.response_status = code
@@ -312,8 +384,9 @@ class ProxyConnection:
             )
 
         # Notify router of disconnect (meaningful for Least-Connections)
-        if self.backend_addr:
+        if self.backend_addr and not self._disconnect_notified:
             self._router.on_disconnect(self.backend_addr)
+            self._disconnect_notified = True
 
         self.state = State.DONE
 
@@ -325,3 +398,8 @@ class ProxyConnection:
                     sock.close()
                 except OSError:
                     pass
+        if self.pending_backend_unregister is not None:
+            try:
+                self.pending_backend_unregister.close()
+            except OSError:
+                pass
