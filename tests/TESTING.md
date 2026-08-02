@@ -1,6 +1,6 @@
 # Testing Documentation
 
-Comprehensive test documentation for the L7 Load Balancer. The test suite contains **41 tests** spanning unit tests, component tests, and full integration tests.
+Comprehensive test documentation for the L7 Load Balancer. The test suite contains **65 tests** spanning unit tests, component tests, and full integration tests.
 
 ## Table of Contents
 
@@ -12,6 +12,9 @@ Comprehensive test documentation for the L7 Load Balancer. The test suite contai
   - [test_router.py — Routing Algorithm Unit Tests](#test_routerpy--routing-algorithm-unit-tests)
   - [test_health_checker.py — Health Checker Tests](#test_health_checkerpy--health-checker-tests)
   - [test_integration.py — End-to-End Integration Tests](#test_integrationpy--end-to-end-integration-tests)
+  - [test_timeouts.py — Per-Connection Timeout Tests](#test_timeoutspy--per-connection-timeout-tests)
+  - [test_workers.py — SO_REUSEPORT Worker Tests](#test_workerspy--soreuseport-worker-tests)
+  - [test_chunked.py — Chunked Response Integration](#test_chunkedpy--chunked-response-integration)
 - [Test Matrix Summary](#test-matrix-summary)
 - [Stress Testing](#stress-testing)
 
@@ -77,7 +80,7 @@ Both helpers use raw `socket.create_connection` — no `urllib` or `requests` �
 
 ### `test_http_parser.py` — HTTP Parser Unit Tests
 
-**17 tests** covering the custom byte-stream HTTP parser (`http_parser.py`).
+**30 tests** covering the custom byte-stream HTTP parser (`http_parser.py`), including Content-Length sentinels and chunked Transfer-Encoding.
 
 #### `TestTryParseRequest` (5 tests)
 
@@ -129,22 +132,42 @@ Tests the `get_content_length()` utility that extracts `Content-Length` from a h
 | 2 | `test_absent` | Headers with no `Content-Length` key → defaults to `0`. |
 | 3 | `test_case_insensitive` | `{"content-length": "10"}` (lowercase) → returns `10`. Ensures case-insensitive matching. |
 
-#### `TestGetResponseContentLength` (2 tests)
+#### `TestGetResponseContentLength` (4 tests)
 
-Tests `get_response_content_length()` which peeks at `Content-Length` in a raw response byte buffer.
+Tests `get_response_content_length()` which peeks at `Content-Length` in a raw response byte buffer. Distinguishes three outcomes: incomplete headers (`-1`), absent header (`CONTENT_LENGTH_ABSENT` / `-2`), and an explicit length (`>= 0`).
 
 | # | Test | What It Verifies |
 |---|------|------------------|
 | 1 | `test_present` | Full response with `Content-Length: 5` → returns `5`. |
-| 2 | `test_no_headers_complete` | Incomplete response buffer (no `\r\n\r\n`) → returns `-1` to signal headers aren't done. |
+| 2 | `test_zero_length` | `Content-Length: 0` → returns `0` (not conflated with “absent”). |
+| 3 | `test_absent` | Headers complete but no `Content-Length` → returns `CONTENT_LENGTH_ABSENT` (`-2`), so the connection layer waits for close-delimited framing. |
+| 4 | `test_no_headers_complete` | Incomplete response buffer (no `\r\n\r\n`) → returns `-1` to signal headers aren't done. |
+
+#### `TestChunkedResponse` (11 tests)
+
+Tests `is_chunked_response()` and `try_consume_chunked_body()` for backend responses with `Transfer-Encoding: chunked`.
+
+| # | Test | What It Verifies |
+|---|------|------------------|
+| 1 | `test_is_chunked_true` | Response with `Transfer-Encoding: chunked` → `True`. |
+| 2 | `test_is_chunked_with_content_length_still_chunked` | Chunked wins even when `Content-Length` is also present (RFC 7230). |
+| 3 | `test_is_chunked_false` | Content-Length-only response → `False`. |
+| 4 | `test_is_chunked_incomplete_headers` | Partial headers → `None`. |
+| 5 | `test_single_chunk` | `5\r\nhello\r\n0\r\n\r\n` parses as a complete framed body. |
+| 6 | `test_multiple_chunks` | Two data chunks plus last-chunk parse completely. |
+| 7 | `test_incomplete_mid_size_line` | Truncated size line → `None`. |
+| 8 | `test_incomplete_mid_data` | Truncated chunk data → `None`. |
+| 9 | `test_with_trailers` | Last-chunk followed by trailer headers then final CRLF. |
+| 10 | `test_chunk_ext` | Size line with chunk-ext (`;foo=bar`) still parses. |
+| 11 | `test_extra_bytes_after_complete` | Returns the length of the complete message and ignores trailing garbage. |
 
 ---
 
 ### `test_router.py` — Routing Algorithm Unit Tests
 
-**13 tests** covering both routing algorithms and the factory function.
+**17 tests** covering both routing algorithms (including `exclude=` for retries) and the factory function.
 
-#### `TestRoundRobin` (5 tests)
+#### `TestRoundRobin` (7 tests)
 
 Tests the `RoundRobinRouter` which cycles through healthy backends using modulo arithmetic.
 
@@ -155,8 +178,10 @@ Tests the `RoundRobinRouter` which cycles through healthy backends using modulo 
 | 3 | `test_mark_unhealthy_removes` | Marks backend #2 unhealthy, then calls `next_backend()` 4 times. Asserts backend #2 is never selected — proving it's excluded from the rotation. |
 | 4 | `test_mark_healthy_restores` | Marks backend #1 unhealthy then immediately marks it healthy again. Verifies it reappears in `get_healthy_backends()`. |
 | 5 | `test_double_mark_healthy_no_duplicate` | Calls `mark_healthy()` on an already-healthy backend. Asserts it appears exactly once in the pool — no duplicate entries that would skew distribution. |
+| 6 | `test_exclude_skips_backend` | `next_backend(exclude={B1})` never returns B1. |
+| 7 | `test_exclude_all_returns_none` | Excluding every healthy backend → `None`. |
 
-#### `TestLeastConnections` (5 tests)
+#### `TestLeastConnections` (7 tests)
 
 Tests the `LeastConnectionsRouter` which uses a min-heap to select the backend with fewest active connections.
 
@@ -167,6 +192,8 @@ Tests the `LeastConnectionsRouter` which uses a min-heap to select the backend w
 | 3 | `test_load_distribution` | Calls `next_backend()` 3 times without any disconnects. Since all start at 0, the heap should distribute picks across all 3 backends. Asserts `set(picks) == set(BACKENDS)`. |
 | 4 | `test_empty_pool` | Marks all backends unhealthy. Asserts `next_backend()` returns `None`. |
 | 5 | `test_disconnect_reduces_count` | Picks a backend, disconnects it, picks again. Verifies the router doesn't crash and returns a valid backend — confirming count decrement works. |
+| 6 | `test_exclude_skips_backend` | With `exclude={B1}`, repeated picks never select B1; excluded heap entries are deferred correctly. |
+| 7 | `test_exclude_all_returns_none` | Excluding every healthy backend → `None`. |
 
 #### `TestFactory` (3 tests)
 
@@ -206,7 +233,7 @@ Tests the `HealthChecker` class which runs periodic health sweeps on a daemon th
 
 ### `test_integration.py` — End-to-End Integration Tests
 
-**7 tests** that spin up actual load balancer instances (reactor + router on ephemeral ports) and send real HTTP traffic through them via raw sockets.
+**10 tests** that spin up actual load balancer instances (reactor + router on ephemeral ports) and send real HTTP traffic through them via raw sockets.
 
 #### Test Fixtures
 
@@ -237,27 +264,73 @@ Tests the `HealthChecker` class which runs periodic health sweeps on a daemon th
 |---|------|------------------|
 | 1 | `test_header_injected` | Sends a GET to `/check-xff` through the LB. Since the mock backend doesn't echo request headers, this test verifies the request completes successfully (no crash from header injection) and the response path matches. The actual `X-Forwarded-For` injection logic is fully covered by `TestInjectForwardedFor` in the parser unit tests. |
 
+#### `TestBackendRetries` (3 tests)
+
+Tests idempotent failover when a backend connect fails.
+
+| # | Test | What It Verifies |
+|---|------|------------------|
+| 1 | `test_get_retries_dead_backend` | Pool is `[dead, live]`. A GET fails over from the dead port to the live mock backend and returns a successful JSON body. |
+| 2 | `test_post_does_not_retry` | POST against a dead-only pool returns `502` without attempting failover (non-idempotent). |
+| 3 | `test_retry_cap_respected` | With `MAX_BACKEND_RETRIES=1` and two dead backends, GET exhausts attempts and returns `502`. |
+
+---
+
+### `test_timeouts.py` — Per-Connection Timeout Tests
+
+**2 tests** covering the deadline heap and state-specific timeouts.
+
+| # | Test | What It Verifies |
+|---|------|------------------|
+| 1 | `TestClientIdleTimeout::test_idle_client_gets_408` | Monkeypatches `CLIENT_IDLE_TIMEOUT` to 0.3s. Opens a TCP connection and sends nothing (Slowloris-style). Asserts the LB responds with `408 Request Timeout`. |
+| 2 | `TestBackendTimeout::test_hung_backend_gets_504` | Spins a backend that sleeps 2s before answering; monkeypatches `BACKEND_TIMEOUT` / `CONNECT_TIMEOUT` to 0.3s and disables retries. Asserts the LB returns `504 Gateway Timeout`. |
+
+---
+
+### `test_workers.py` — SO_REUSEPORT Worker Tests
+
+**1 test** (skipped when `SO_REUSEPORT` is unavailable).
+
+| # | Test | What It Verifies |
+|---|------|------------------|
+| 1 | `test_two_reactors_bind_same_port` | Two `Reactor` instances with `require_reuseport=True` bind the same listen port. A client GET succeeds against that shared port. |
+
+---
+
+### `test_chunked.py` — Chunked Response Integration
+
+**1 test** covering end-to-end chunked Transfer-Encoding passthrough.
+
+| # | Test | What It Verifies |
+|---|------|------------------|
+| 1 | `test_chunked_response_relayed` | Starts a raw TCP backend that replies with `Transfer-Encoding: chunked` and two data chunks. Proxies a GET through the LB and asserts the client receives the chunked framing (`5\r\nhello\r\n`, terminating `0\r\n\r\n`) intact. |
+
 ---
 
 ## Test Matrix Summary
 
-| Module | Test Class | Tests | Type | Layer Tested |
-|--------|-----------|-------|------|-------------|
+| Module | Test Class / Case | Tests | Type | Layer Tested |
+|--------|-------------------|-------|------|-------------|
 | `test_http_parser.py` | `TestTryParseRequest` | 5 | Unit | HTTP Parser |
 | `test_http_parser.py` | `TestInjectForwardedFor` | 2 | Unit | Header Injection |
 | `test_http_parser.py` | `TestSerialiseRequest` | 2 | Unit | Request Serialisation |
 | `test_http_parser.py` | `TestParseResponseStatus` | 3 | Unit | Response Parsing |
 | `test_http_parser.py` | `TestGetContentLength` | 3 | Unit | Header Extraction |
-| `test_http_parser.py` | `TestGetResponseContentLength` | 2 | Unit | Response Header Extraction |
-| `test_router.py` | `TestRoundRobin` | 5 | Unit | Round-Robin Algorithm |
-| `test_router.py` | `TestLeastConnections` | 5 | Unit | Least-Connections Algorithm |
+| `test_http_parser.py` | `TestGetResponseContentLength` | 4 | Unit | Response CL sentinels |
+| `test_http_parser.py` | `TestChunkedResponse` | 11 | Unit | Chunked TE framing |
+| `test_router.py` | `TestRoundRobin` | 7 | Unit | Round-Robin + exclude |
+| `test_router.py` | `TestLeastConnections` | 7 | Unit | Least-Connections + exclude |
 | `test_router.py` | `TestFactory` | 3 | Unit | Router Factory |
 | `test_health_checker.py` | `TestProbe` | 2 | Component | TCP/HTTP Probing |
-| `test_health_checker.py` | `TestHealthChecker` | 2 | Component | Daemon Thread + Router Integration |
+| `test_health_checker.py` | `TestHealthChecker` | 2 | Component | Daemon Thread + Router |
 | `test_integration.py` | `TestRoundRobinIntegration` | 4 | Integration | Full proxy pipeline (RR) |
 | `test_integration.py` | `TestLeastConnectionsIntegration` | 2 | Integration | Full proxy pipeline (LC) |
 | `test_integration.py` | `TestXForwardedFor` | 1 | Integration | Header injection through proxy |
-| | | **41** | | |
+| `test_integration.py` | `TestBackendRetries` | 3 | Integration | Idempotent failover |
+| `test_timeouts.py` | Idle / backend timeouts | 2 | Integration | Deadline heap (408 / 504) |
+| `test_workers.py` | SO_REUSEPORT dual bind | 1 | Integration | Multi-reactor listen share |
+| `test_chunked.py` | Chunked relay | 1 | Integration | Chunked response passthrough |
+| | | **65** | | |
 
 ### Coverage by Component
 
@@ -265,20 +338,24 @@ Tests the `HealthChecker` class which runs periodic health sweeps on a daemon th
 ┌────────────────────────────────────────────────────────────────┐
 │ Component             │ Unit │ Component │ Integration │ Total │
 ├───────────────────────┼──────┼───────────┼─────────────┤───────┤
-│ HTTP Parser           │  17  │     -     │      -      │   17  │
-│ Router (Round-Robin)  │   5  │     -     │      4      │    9  │
-│ Router (Least-Conn)   │   5  │     -     │      2      │    7  │
+│ HTTP Parser           │  30  │     -     │      1*     │   31  │
+│ Router (Round-Robin)  │   7  │     -     │      4      │   11  │
+│ Router (Least-Conn)   │   7  │     -     │      2      │    9  │
 │ Router Factory        │   3  │     -     │      -      │    3  │
 │ Health Checker        │   -  │     4     │      -      │    4  │
-│ X-Forwarded-For       │   2  │     -     │      1      │    3  │ *
-│ Reactor / Connection  │   -  │     -     │      7      │    7  │ **
+│ Retries / failover    │   -  │     -     │      3      │    3  │
+│ Timeouts              │   -  │     -     │      2      │    2  │
+│ Workers / REUSEPORT   │   -  │     -     │      1      │    1  │
+│ X-Forwarded-For       │   2† │     -     │      1      │    3  │
+│ Reactor / Connection  │   -  │     -     │     14‡     │   14  │
 ├───────────────────────┼──────┼───────────┼─────────────┤───────┤
-│ Total unique tests    │  30  │     4     │      7      │   41  │
+│ Total unique tests    │  47  │     4     │     14      │   65  │
 └────────────────────────────────────────────────────────────────┘
 
- * X-Forwarded-For unit tests are counted under HTTP Parser
-** Reactor & Connection have no isolated unit tests; they are exercised
-   exclusively through integration tests which start real reactor instances
+ * chunked end-to-end relay counted under Integration
+ † XFF unit tests are also part of the HTTP Parser unit count
+ ‡ Reactor/Connection exercised via integration, timeouts, retries,
+   workers, and chunked modules (not double-counted in the 65 total)
 ```
 
 ---
@@ -315,6 +392,9 @@ python3 mock_backends.py
 
 # Start load balancer (terminal 2)
 python3 main.py --algorithm least_connections
+
+# Multi-worker (SO_REUSEPORT)
+python3 main.py --workers 4
 
 # Send requests (terminal 3)
 for i in $(seq 1 10); do curl -s http://localhost:8080/test | jq .backend; done
